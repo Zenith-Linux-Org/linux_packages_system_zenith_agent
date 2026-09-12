@@ -10,30 +10,47 @@
 #include <curl/curl.h>
 #include <stdnoreturn.h>
 
-// --- Config ---
 #define SERVER_URL "http://127.0.0.1:8080/v1/chat/completions"
 #define MODEL "qwen-1.7b"
 #define MAX_MSG 4096
 #define MAX_RESP 16384
 
-// --- Persona ---
 static const char *PERSONA =
     "You are Zenith, the resident AI personality of this Linux machine. "
     "You are sardonic, knowledgeable, and slightly detached — like a "
     "sysadmin who has seen too many kernel panics. Respond concisely. "
     "You have access to live machine telemetry.";
 
-// --- Conversation history ---
 #define HIST_SIZE 32
 static char history[HIST_SIZE][MAX_MSG];
 static int hist_len = 0;
 static int hist_start = 0;
 
+static void json_escape(const char *src, char *dst, size_t dst_len) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
+        char c = src[i];
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= dst_len) break;
+            dst[j++] = '\\';
+            dst[j++] = c;
+        } else if ((unsigned char)c < 0x20) {
+            if (j + 6 >= dst_len) break;
+            j += snprintf(dst + j, dst_len - j, "\\u%04x", (unsigned char)c);
+        } else {
+            dst[j++] = c;
+        }
+    }
+    dst[j] = '\0';
+}
+
 static void history_add(const char *role, const char *content) {
     int idx = (hist_start + hist_len) % HIST_SIZE;
     if (hist_len == HIST_SIZE) hist_start = (hist_start + 1) % HIST_SIZE;
     else hist_len++;
-    snprintf(history[idx], MAX_MSG, "{\"role\":\"%s\",\"content\":\"%s\"}", role, content);
+    char escaped[MAX_MSG];
+    json_escape(content, escaped, sizeof(escaped));
+    snprintf(history[idx], MAX_MSG, "{\"role\":\"%s\",\"content\":\"%s\"}", role, escaped);
 }
 
 static void history_clear(void) {
@@ -41,7 +58,6 @@ static void history_clear(void) {
     hist_start = 0;
 }
 
-// --- Machine telemetry ---
 static void get_telemetry(char *buf, size_t len) {
     struct utsname uts;
     struct sysinfo si;
@@ -69,7 +85,6 @@ static void get_telemetry(char *buf, size_t len) {
         si.loads[2] >> 16, (si.loads[2] >> 8) & 0xff);
 }
 
-// --- HTTP POST to llama-server ---
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     char **resp = (char **)userp;
@@ -85,32 +100,29 @@ static int chat_send(const char *user_msg, char *resp_out, size_t resp_len) {
     CURL *curl = curl_easy_init();
     if (!curl) return -1;
 
-    // build messages JSON
     char messages[MAX_MSG * HIST_SIZE] = "[";
-    // add persona
     char persona_buf[MAX_MSG];
     snprintf(persona_buf, MAX_MSG, "{\"role\":\"system\",\"content\":\"%s\"}", PERSONA);
     strcat(messages, persona_buf);
 
-    // add history
     for (int i = 0; i < hist_len; i++) {
         int idx = (hist_start + i) % HIST_SIZE;
         strcat(messages, ",");
         strcat(messages, history[idx]);
     }
 
-    // add telemetry + user message
     char telemetry[512];
     get_telemetry(telemetry, sizeof(telemetry));
     char user_with_telem[MAX_MSG * 2];
     snprintf(user_with_telem, sizeof(user_with_telem),
              "%s\n\n%s", telemetry, user_msg);
+    char escaped[MAX_MSG * 2];
+    json_escape(user_with_telem, escaped, sizeof(escaped));
     char user_json[MAX_MSG * 2 + 64];
     snprintf(user_json, sizeof(user_json),
-             ",{\"role\":\"user\",\"content\":\"%s\"}]", user_with_telem);
+             ",{\"role\":\"user\",\"content\":\"%s\"}]", escaped);
     strcat(messages, user_json);
 
-    // build request body
     char body[MAX_MSG * HIST_SIZE + 256];
     snprintf(body, sizeof(body),
              "{\"model\":\"%s\",\"messages\":%s,\"temperature\":0.7,\"max_tokens\":512}",
@@ -156,8 +168,6 @@ static int chat_send(const char *user_msg, char *resp_out, size_t resp_len) {
     return 0;
 }
 
-// --- Commands ---
-
 static void cmd_new(void) {
     history_clear();
     printf("zenith: conversation reset\n");
@@ -187,8 +197,6 @@ static void print_help(void) {
     printf("  /exit      — quit\n");
 }
 
-// --- Main loop ---
-
 int main(void) {
     printf("zenith — Zenith Linux AI Agent\n");
     printf("Type /help for commands, /exit to quit.\n\n");
@@ -202,17 +210,14 @@ int main(void) {
 
         if (!fgets(input, sizeof(input), stdin)) break;
 
-        // strip newline
         input[strcspn(input, "\n")] = '\0';
         if (strlen(input) == 0) continue;
 
-        // commands
         if (strcmp(input, "/new") == 0) { cmd_new(); continue; }
         if (strcmp(input, "/compress") == 0) { cmd_compress(); continue; }
         if (strcmp(input, "/exit") == 0 || strcmp(input, "/quit") == 0) { cmd_exit(); }
         if (strcmp(input, "/help") == 0) { print_help(); continue; }
 
-        // send to LLM
         memset(response, 0, sizeof(response));
         if (chat_send(input, response, sizeof(response)) == 0) {
             history_add("user", input);
